@@ -359,6 +359,16 @@ def register() -> None:
 
     Use ``extra_args={"output_residual_stream": True | list[int]}`` in
     SamplingParams to request activations.
+
+    Optionally add ``extra_args={..., "extract_only": True}`` to truncate
+    the model's forward pass after the deepest captured layer. The
+    generated token in this case is unspecified (the lm_head still runs
+    on the truncated hidden state, producing logits the caller should
+    ignore). The optimisation only fires when *every* request in the
+    same batch sets ``extract_only`` and supplies an explicit layer
+    list — a single non-extract request defeats the speedup for the
+    whole batch. Captured activations are bit-identical to the
+    full-forward path.
     """
     global _original_create_engine_config
     global _original_generate, _original_llm_generate

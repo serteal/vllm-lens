@@ -33,26 +33,36 @@ logger = logging.getLogger(__name__)
 _ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
 
 
-def _get_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
-    """Find the transformer decoder layers regardless of model architecture."""
+def _get_decoder_module(model: torch.nn.Module) -> torch.nn.Module:
+    """Find the transformer decoder module regardless of model architecture.
+
+    The returned module is the one that owns ``.layers`` (and, on every
+    vLLM model that goes through ``make_layers``, ``.start_layer`` /
+    ``.end_layer`` / ``.norm``). ``_get_layers`` is sugar over this.
+    """
     # Module.__getattr__ returns Tensor | Module, so pyright can't narrow
     # through chained attribute access.  Use Any for duck-typed traversal.
     m: Any = model
     if hasattr(m, "language_model") and hasattr(m.language_model, "model"):
-        return m.language_model.model.layers
+        return m.language_model.model
     if (
         hasattr(m, "model")
         and hasattr(m.model, "decoder")
         and hasattr(m.model.decoder, "layers")
     ):
-        return m.model.decoder.layers
+        return m.model.decoder
     if hasattr(m, "model") and hasattr(m.model, "layers"):
-        return m.model.layers
+        return m.model
     raise AttributeError(
-        f"Cannot find decoder layers on {type(model).__name__}. "
-        "Expected model.language_model.model.layers, "
-        "model.model.decoder.layers, or model.model.layers"
+        f"Cannot find decoder module on {type(model).__name__}. "
+        "Expected model.language_model.model, "
+        "model.model.decoder, or model.model."
     )
+
+
+def _get_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
+    """Find the transformer decoder layers regardless of model architecture."""
+    return _get_decoder_module(model).layers  # type: ignore[return-value]
 
 
 def _find_steering_configs(
@@ -304,6 +314,85 @@ def _make_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable:
     return hook
 
 
+def _extract_only_max_layer(extension: HiddenStatesExtension) -> int | None:
+    """Compute the early-exit layer for the current step, or ``None``.
+
+    Returns the maximum captured-layer index across all requests in the
+    batch *iff* every request opted in via ``extra_args["extract_only"]``
+    and supplied an explicit ``output_residual_stream`` layer list.
+
+    Any of: a non-extract request in the batch, an unknown request state,
+    a missing/non-list ``output_residual_stream``, or an empty batch
+    disables the optimisation (returns ``None``) — the model then runs
+    the full forward as before.
+
+    Cheap path (no extract requests): one runtime check per call.
+    """
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    if num_reqs == 0:
+        return None
+
+    max_layer: int | None = None
+    for i in range(num_reqs):
+        req_id = runner.input_batch.req_ids[i]
+        req_state = runner.requests.get(req_id)
+        if req_state is None or req_state.sampling_params is None:
+            return None
+        extra = req_state.sampling_params.extra_args
+        if not extra or not extra.get("extract_only"):
+            return None
+        layers = extra.get("output_residual_stream")
+        if not isinstance(layers, list) or not layers:
+            return None
+        req_max = max(layers)
+        max_layer = req_max if max_layer is None else max(max_layer, req_max)
+    return max_layer
+
+
+def _install_early_exit_forward(
+    extension: HiddenStatesExtension, decoder: torch.nn.Module
+) -> None:
+    """Wrap the decoder module's ``forward`` to apply early-exit when eligible.
+
+    We cannot use ``register_forward_pre_hook`` / ``register_forward_hook``
+    on the decoder module: vLLM decorates it with ``@support_torch_compile``,
+    whose generated ``__call__`` (under ``enforce_eager``) does
+    ``return self.forward(*args, **kwargs)`` directly — bypassing
+    ``nn.Module.__call__`` and therefore bypassing all hooks installed on
+    the decoder. Layer hooks still work because individual decoder layers
+    aren't decorated.
+
+    Patching the instance's bound ``forward`` works because the
+    decorator's ``__call__`` does an instance-attribute lookup on
+    ``self.forward``. We set ``decoder.forward`` on the instance, which
+    shadows the class method.
+    """
+    orig_forward = decoder.forward  # bound method; closed over below
+
+    def early_exit_forward(*args: Any, **kwargs: Any) -> Any:
+        max_layer = _extract_only_max_layer(extension)
+        if max_layer is None:
+            return orig_forward(*args, **kwargs)
+        current_end = getattr(decoder, "end_layer", None)
+        if current_end is None:
+            return orig_forward(*args, **kwargs)
+        new_end = min(max_layer + 1, current_end)
+        if new_end >= current_end:
+            return orig_forward(*args, **kwargs)
+        # ``end_layer`` is the *exclusive* upper bound of the islice the
+        # decoder's forward uses to iterate layers; capturing at
+        # ``max_layer`` requires it to be included, hence ``max_layer + 1``.
+        decoder.end_layer = new_end  # type: ignore[assignment]
+        try:
+            return orig_forward(*args, **kwargs)
+        finally:
+            decoder.end_layer = current_end  # type: ignore[assignment]
+
+    decoder.forward = early_exit_forward  # type: ignore[method-assign]
+    extension._early_exit_installed = True
+
+
 class HiddenStatesExtension:
     """Mixin injected into vLLM's GPU Worker at runtime.
 
@@ -336,12 +425,21 @@ class HiddenStatesExtension:
     # Whether this rank should capture activations (only TP rank 0).
     _should_capture: bool = True
 
+    # ``True`` after :func:`_install_early_exit_forward` patches the
+    # decoder's instance ``forward``. We only patch once per worker.
+    _early_exit_installed: bool = False
+
     def install_hooks(self) -> None:
         """Register a forward hook on every decoder layer. Idempotent.
 
         Hooks are installed on **all** TP ranks because steering must
         modify hidden states everywhere.  Activation *capture* is gated
         to rank 0 only via ``_should_capture``.
+
+        Also wraps the decoder module's bound ``forward`` so that batches
+        in which every request opted in via ``extra_args["extract_only"]``
+        truncate the layer loop at the deepest captured layer. The wrap
+        no-ops cheaply on normal batches.
 
         Requires ``enforce_eager=True`` in engine args — otherwise
         ``@support_torch_compile`` would compile the forward graph and
@@ -361,11 +459,19 @@ class HiddenStatesExtension:
 
         # Hooks must be installed on ALL ranks so steering vectors are
         # applied everywhere (not just rank 0).
-        layers = _get_layers(self.model_runner.model)
-        for layer_idx, layer in enumerate(layers):
+        decoder = _get_decoder_module(self.model_runner.model)
+        for layer_idx, layer in enumerate(decoder.layers):  # type: ignore[attr-defined]
             if isinstance(layer, PPMissingLayer):
                 continue
             layer.register_forward_hook(_make_hook(self, layer_idx))
+
+        # The decoder is wrapped by ``@support_torch_compile`` whose
+        # generated ``__call__`` calls ``self.forward`` directly under
+        # ``enforce_eager``, bypassing ``nn.Module``'s hook dispatch.
+        # We therefore wrap the decoder's bound ``forward`` instead.
+        # Installed on every rank so that all TP ranks truncate
+        # consistently and stay in sync.
+        _install_early_exit_forward(self, decoder)
 
     # ------------------------------------------------------------------
     # Steering data management (called via collective_rpc)
