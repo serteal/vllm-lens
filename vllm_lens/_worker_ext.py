@@ -18,6 +18,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
+import vllm.envs as vllm_envs
 import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import PPMissingLayer
@@ -476,24 +477,30 @@ class HiddenStatesExtension:
 
     def get_captured_states_batch(
         self, external_req_ids: list[str]
-    ) -> bytes | None:
+    ) -> dict[str, dict[str, Any]] | bytes | None:
         """Retrieve captured activations for many requests in one RPC.
 
         Equivalent to calling :meth:`get_captured_states` once per id, but
-        emits a single payload covering every request that has data. At
-        large batch sizes the per-request ``collective_rpc`` roundtrip is
-        the dominant cost on the offline ``LLM.generate`` path; batching it
-        cuts N round-trips to one.
+        emits a single payload covering every request that has data.
 
-        Returns ``pickle.dumps({external_req_id: payload, ...})`` where
-        each ``payload`` is ``{"activations": {"residual_stream": Tensor}}``.
-        Missing or unmatched ids are simply absent; ``None`` if nothing
-        matched at all.
+        Return format depends on ``VLLM_ALLOW_INSECURE_SERIALIZATION``:
 
-        We deliberately don't ``zstd``-compress here: this RPC only fires
-        on the offline ``LLM.generate`` path, which is in-process IPC,
-        not HTTP. ``get_captured_states`` keeps zstd for the OpenAI/Inspect
-        path where the response crosses the network.
+        * **Set (fast path).** Returns a native dict
+          ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``.
+          vLLM's ``MsgpackEncoder`` handles ``torch.Tensor`` with zero-copy
+          aux buffers: the tensor storage rides as an out-of-band buffer
+          and the inline payload only carries ``[dtype, shape, buf_idx]``.
+          That avoids the full-storage memcopy that ``pickle`` performs on
+          both encode and decode — a meaningful chunk of wall time at
+          large N and long prompts, where the activation transfer is the
+          dominant cost.
+
+        * **Unset (compatible path).** Returns ``pickle.dumps(dict)``. The
+          plugin's :func:`_decode_rank_payload` unpickles it transparently.
+          This branch is correct without any env-var changes.
+
+        Missing or unmatched ids are simply absent from the dict; ``None``
+        if nothing matched at all.
         """
         if not external_req_ids:
             return None
@@ -507,6 +514,11 @@ class HiddenStatesExtension:
                     break
         if not out:
             return None
+        # ``vllm.envs`` caches values once ``EngineCore.__init__`` calls
+        # ``enable_envs_cache()``, so this attribute read is a cached
+        # bool lookup, not a syscall.
+        if vllm_envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+            return out
         return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _debug_captured_states_count(self) -> int:

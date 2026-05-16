@@ -82,13 +82,17 @@ def _merge_captured_states(
 
 
 def _merge_captured_states_batch(
-    states_per_rank: list[bytes | None] | None,
+    states_per_rank: list[Any] | None,
     external_req_ids: Sequence[str],
 ) -> dict[str, dict[str, Any]]:
     """Merge a batched ``get_captured_states_batch`` response across PP ranks.
 
-    Each rank returns either ``None`` or pickled bytes encoding
-    ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``.
+    Each rank returns either ``None`` or one of two payload shapes,
+    depending on whether the worker took the zero-copy fast path:
+
+    * a native dict ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``
+      when ``VLLM_ALLOW_INSECURE_SERIALIZATION`` is set;
+    * pickled bytes encoding the same structure otherwise.
 
     For PP > 1 we concatenate the per-id residual streams along dim 0 in
     rank order — same convention as :func:`_merge_captured_states`, just
@@ -101,9 +105,14 @@ def _merge_captured_states_batch(
     """
     if not states_per_rank:
         return {}
-    rank_dicts: list[dict[str, dict[str, Any]]] = [
-        _decode_rank_payload(s) for s in states_per_rank if s is not None
-    ]
+    rank_dicts: list[dict[str, dict[str, Any]]] = []
+    for s in states_per_rank:
+        if s is None:
+            continue
+        if isinstance(s, (bytes, bytearray, memoryview)):
+            rank_dicts.append(_decode_rank_payload(bytes(s)))
+        else:
+            rank_dicts.append(s)
     if not rank_dicts:
         return {}
     out: dict[str, dict[str, Any]] = {}
